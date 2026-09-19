@@ -1,0 +1,136 @@
+name: Build WESTCOAST-KSU Kernel (mojito)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a GitHub Release with the zip"
+        type: boolean
+        default: true
+
+env:
+  KERNEL_REPO: LUNA-OSS-ONYX/mojito_ksu
+  KERNEL_BRANCH: "KSU"
+  AK3_REPO: sp-projectss/AnyKernel3
+  AK3_BRANCH: mojito
+  CLANG_VER: clang-r596125
+  CLANG_AOSP_BRANCH: main-kernel
+  DEFCONFIG: mojito_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            build-essential ccache curl git zip \
+            python3 python3-pip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libncurses-dev
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.AK3_REPO }}
+          ref: ${{ env.AK3_BRANCH }}
+          path: AnyKernel3
+          fetch-depth: 1
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ env.DEFCONFIG }}
+
+      - name: Download clang toolchain (AOSP mirror)
+        run: |
+          mkdir -p ${{ env.CLANG_VER }}
+          curl -s "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.CLANG_AOSP_BRANCH }}/${{ env.CLANG_VER }}.tar.gz" \
+            | tar -xz -C ${{ env.CLANG_VER }}
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          CLANG_DIR="${GITHUB_WORKSPACE}/${{ env.CLANG_VER }}"
+          export PATH="$CLANG_DIR/bin:$PATH"
+          export LD_LIBRARY_PATH="$CLANG_DIR/lib:$CLANG_DIR/lib64:$LD_LIBRARY_PATH"
+          echo "$PATH"
+
+          make O=out ARCH=arm64 ${{ env.DEFCONFIG }}
+
+          make -j$(nproc) ARCH=arm64 SUBARCH=arm64 O=out \
+            CC="ccache clang" \
+            AR="llvm-ar" \
+            NM="llvm-nm" \
+            LD="ld.lld -S" \
+            OBJCOPY="llvm-objcopy" \
+            OBJDUMP="llvm-objdump" \
+            STRIP="llvm-strip" \
+            CLANG_TRIPLE="aarch64-linux-gnu-" \
+            CROSS_COMPILE="aarch64-linux-gnu-" \
+            CROSS_COMPILE_ARM32="arm-linux-gnueabi-" \
+            CROSS_COMPILE_COMPAT="arm-linux-gnueabi-" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            INSTALL_MOD_STRIP=1 \
+            KBUILD_BUILD_USER="${{ github.actor }}" \
+            KBUILD_BUILD_HOST="github-actions"
+
+          ccache -s
+
+      - name: Verify kernel Image exists
+        run: |
+          if [ ! -f kernel/out/arch/arm64/boot/Image ]; then
+            echo "::error::Image not found — build failed"
+            exit 1
+          fi
+
+      - name: Package into AnyKernel3 zip
+        run: |
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          [ -f kernel/out/arch/arm64/boot/dtbo.img ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/ || true
+
+          SM6150_DTB=$(find kernel/out/arch/arm64/boot/dts -name "sm6150.dtb" | head -n1)
+          if [ -n "$SM6150_DTB" ]; then
+            cat "$SM6150_DTB" > AnyKernel3/dtb
+            echo "Packed $SM6150_DTB as AnyKernel3/dtb"
+          else
+            echo "::error::sm6150.dtb not found under arch/arm64/boot/dts"
+            find kernel/out/arch/arm64/boot/dts -name "*.dtb"
+            exit 1
+          fi
+
+          cd AnyKernel3
+          ZIP_NAME="WESTCOAST-KSU-mojito-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" * -x ".git*" -x "README.md"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Build summary
+        run: |
+          {
+            echo "### Build complete"
+            echo "- Kernel: \`${KERNEL_REPO}@${KERNEL_BRANCH}\`"
+            echo "- Defconfig: \`${DEFCONFIG}\`"
+            echo "- Artifact: \`${ZIP_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
